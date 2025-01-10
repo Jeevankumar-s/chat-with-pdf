@@ -13,3 +13,4 @@ langchain-groq==0.0.1
 chromadb==0.4.22
 sentence-transformers==2.2.2
 python-docx==1.0.1  # for docx2txt
+gunicorn==20.1.0
