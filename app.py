@@ -399,11 +399,19 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
 
 
+@app.route('/hello-world')
+def hello_world():
+    return 'Hello, World!'
+
+
 # Routes
 @app.route('/')
 def home():
     """Render the home page"""
     return render_template('index.html')
+
+
+
 
 
 @app.route('/upload', methods=['POST', 'OPTIONS'])
@@ -513,4 +521,4 @@ if __name__ == '__main__':
     Config.TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
 
     # Start the Flask application
-    app.run(debug=True, port=8080)
+    app.run(debug=True, host='0.0.0.0', port=8080)
