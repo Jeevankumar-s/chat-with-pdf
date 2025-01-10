@@ -17,6 +17,13 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import html
+import backoff
+import itertools
+from time import sleep
+from random import uniform
+from requests.exceptions import RequestException
+from duckduckgo_search import DDGS
+
 
 # Document Processing
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
@@ -27,22 +34,18 @@ from langchain_groq import ChatGroq
 from langchain.chains import ConversationalRetrievalChain
 from langchain.docstore.document import Document
 
-# Web Search
-from googlesearch import search
-from newspaper import Article
-
 # Initialize Flask app with proper CORS configuration
 app = Flask(__name__)
-# More permissive CORS configuration for development
 CORS(app,
      resources={r"/*": {
-         "origins": "*",  # Allow all origins in development
+         "origins": "*",
          "methods": ["GET", "POST", "OPTIONS"],
          "allow_headers": ["Content-Type"],
          "supports_credentials": True
      }})
 app.secret_key = os.urandom(24)
 load_dotenv()
+
 
 # Configuration
 class Config:
@@ -51,6 +54,7 @@ class Config:
     ALLOWED_EXTENSIONS = {'pdf', 'docx'}
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max file size
     GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+
 
 app.config.from_object(Config)
 
@@ -61,6 +65,78 @@ Config.TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+from duckduckgo_search import DDGS
+import itertools
+import logging
+
+
+class RateLimitedSearcher:
+    def __init__(self, max_retries=3, base_delay=2):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.session = requests.Session()
+        self.ddgs = DDGS()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1'
+        })
+
+    def search(self, query):
+        """Perform web search with rate limiting and error handling"""
+        results = []
+        try:
+            # Get raw search results
+            search_generator = self.ddgs.text(
+                keywords=query,
+                region='wt-wt',
+                safesearch='moderate'
+            )
+
+            # Convert generator to list and take first 5 results
+            raw_results = list(itertools.islice(search_generator, 5))
+
+            for result in raw_results:
+                try:
+                    # Debug log the raw result
+                    logger.debug(f"Raw result: {result}")
+
+                    # Extract data using the correct field names
+                    url = result.get('href') or result.get('url')
+                    if not url:
+                        logger.warning("No URL found in result")
+                        continue
+
+                    title = result.get('title', '')
+                    description = result.get('snippet', '') or result.get('description', '')
+
+                    # Clean and format the data
+                    title = html.unescape(str(title)).strip()
+                    title = ' '.join(title.split())[:100]
+
+                    description = html.unescape(str(description)).strip()
+                    description = ' '.join(description.split())[:200]
+
+                    results.append({
+                        "url": url,
+                        "title": title,
+                        "summary": description
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Error processing search result: {str(e)}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Search error: {str(e)}")
+
+        # Debug log the final results
+        logger.debug(f"Processed results: {results}")
+        return results
+
 
 class DocumentProcessor:
     def __init__(self):
@@ -77,8 +153,8 @@ class DocumentProcessor:
         self.is_document_loaded = False
         self.last_access = time.time()
         self.current_pdf_path = None
-        self.page_mapping = {}  # Maps content to page numbers
-        self.doc_pages = None  # Store PyMuPDF document pages
+        self.page_mapping = {}
+        self.doc_pages = None
 
     def _initialize_llm(self):
         """Initialize and return the LLM"""
@@ -290,73 +366,20 @@ class DocumentProcessor:
             return {"status": "error", "error": str(e)}
 
     def web_search(self, query):
-        """Perform web search and return results with improved error handling"""
+        """Perform web search using rate-limited searcher"""
         try:
             self.last_access = time.time()
-            results = []
-
-            # Perform the search query
-            search_results = search(query, num_results=5, lang="en")
-
-            # Process each search result
-            for url in search_results:
-                try:
-                    # Ensure URL is properly formatted
-                    if not url.startswith('http'):
-                        url = 'http://' + url
-
-                    # Check if URL is valid
-                    if not url or not urlparse(url).scheme:
-                        logger.warning(f"Invalid URL: {url}")
-                        continue
-
-                    # Request headers to simulate a real browser request
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    }
-
-                    # Send the request to fetch page content
-                    response = requests.get(url, headers=headers, timeout=5)
-                    response.raise_for_status()
-
-                    # Parse the content with BeautifulSoup
-                    soup = BeautifulSoup(response.text, 'html.parser')
-
-                    # Extract title from the page
-                    title = soup.title.string if soup.title else url
-                    title = html.unescape(title)
-                    title = ' '.join(title.split())
-                    title = title[:100] + '...' if len(title) > 100 else title
-
-                    # Remove unwanted tags
-                    for tag in soup(['script', 'style', 'meta', 'link', 'header', 'footer', 'nav']):
-                        tag.decompose()
-
-                    # Extract text from the page
-                    text = soup.get_text(separator=' ', strip=True)
-                    text = ' '.join(text.split())
-                    summary = text[:200] + '...' if len(text) > 200 else text
-
-                    # Append the result
-                    results.append({
-                        "url": url,
-                        "title": title,
-                        "summary": summary
-                    })
-
-                except Exception as e:
-                    logger.warning(f"Error processing search result {url}: {str(e)}")
-                    continue
-
-            return results
-
+            searcher = RateLimitedSearcher()
+            return searcher.search(query)
         except Exception as e:
             logger.error(f"Web search error: {str(e)}")
             return []
 
+
 # Create processors dictionary
 processors = {}
 processor_lock = threading.Lock()
+
 
 def get_processor():
     """Get or create a processor for the current session"""
@@ -370,15 +393,18 @@ def get_processor():
             processors[session_id] = DocumentProcessor()
         return processors[session_id]
 
+
 def allowed_file(filename):
     """Check if file type is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
+
 
 # Routes
 @app.route('/')
 def home():
     """Render the home page"""
     return render_template('index.html')
+
 
 @app.route('/upload', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -410,6 +436,7 @@ def upload_file():
         logger.error(f"Upload error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/ask', methods=['POST'])
 def ask():
     """Handle user questions"""
@@ -430,9 +457,6 @@ def ask():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-
-
-
 @app.route('/search', methods=['POST'])
 def web_search():
     """Handle web search requests"""
@@ -444,13 +468,14 @@ def web_search():
             return jsonify({'results': [], 'error': 'No query provided'}), 400
 
         processor = get_processor()
-        results = processor.web_search(query)  # This now returns a list directly
+        results = processor.web_search(query)
 
         return jsonify({'results': results}), 200
 
     except Exception as e:
         logger.error(f"Error during web search: {str(e)}")
         return jsonify({'results': [], 'error': str(e)}), 500
+
 
 @app.route('/download/<filename>', methods=['GET'])
 def download_file(filename):
@@ -461,8 +486,31 @@ def download_file(filename):
     else:
         return jsonify({'status': 'error', 'message': 'File not found'}), 404
 
+
+# Cleanup function to remove old processors
+def cleanup_old_processors():
+    """Remove processors that haven't been accessed in the last hour"""
+    while True:
+        try:
+            current_time = time.time()
+            with processor_lock:
+                for session_id, processor in list(processors.items()):
+                    if current_time - processor.last_access > 3600:  # 1 hour
+                        del processors[session_id]
+            time.sleep(1800)  # Run cleanup every 30 minutes
+        except Exception as e:
+            logger.error(f"Error during processor cleanup: {str(e)}")
+            time.sleep(60)  # Wait a minute before retrying if there's an error
+
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_old_processors, daemon=True)
+cleanup_thread.start()
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Ensure the upload and temp directories exist
+    Config.UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+    Config.TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
 
-
-
+    # Start the Flask application
+    app.run(debug=True, port=8080)
